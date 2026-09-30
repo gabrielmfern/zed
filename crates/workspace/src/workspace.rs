@@ -62,9 +62,9 @@ use futures::{
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
     Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
     WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
     transparent_black,
 };
@@ -498,8 +498,23 @@ actions!(
         RestoreBanner,
         /// Toggles expansion of the selected item.
         ToggleExpandItem,
+        ActivateNextTabPage,
+        ActivatePreviousTabPage,
+        CloseTabPage,
     ]
 );
+
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = workspace)]
+pub struct ActivateTabPage(pub usize);
+
+#[derive(Clone, Default, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct NewTabPage {
+    #[serde(default)]
+    pub terminal: bool,
+}
 
 /// Activates a specific pane by its index.
 #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
@@ -1584,6 +1599,8 @@ pub struct Workspace {
     zoomed_position: Option<DockPosition>,
     maximized_pane: Option<WeakEntity<Pane>>,
     center: PaneGroup,
+    tab_pages: Vec<TabPage>,
+    active_tab_page: usize,
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
@@ -1656,6 +1673,13 @@ pub struct Workspace {
 }
 
 impl EventEmitter<Event> for Workspace {}
+
+struct TabPage {
+    center: PaneGroup,
+    active_pane: WeakEntity<Pane>,
+}
+
+const TAB_PAGES_MARKER: f32 = -1.0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ViewId {
@@ -2092,6 +2116,8 @@ impl Workspace {
             maximized_pane: None,
             previous_dock_drag_coordinates: None,
             center,
+            tab_pages: Vec::new(),
+            active_tab_page: 0,
             panes: vec![center_pane.clone()],
             panes_by_item: Default::default(),
             active_pane: center_pane.clone(),
@@ -4479,7 +4505,12 @@ impl Workspace {
             tasks.push(current_pane_close);
         }
 
-        for pane in self.panes() {
+        let panes = if retain_active_pane {
+            self.center.panes().into_iter().cloned().collect()
+        } else {
+            self.panes.clone()
+        };
+        for pane in &panes {
             if retain_active_pane && pane.entity_id() == current_pane.entity_id() {
                 continue;
             }
@@ -6047,6 +6078,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(index) = self.background_tab_page_index(pane) {
+            self.activate_tab_page(index, window, cx);
+            window.focus(&pane.focus_handle(cx), cx);
+        }
         self.active_pane = pane.clone();
         self.active_item_path_changed(true, window, cx);
         self.last_active_center_pane = Some(pane.downgrade());
@@ -6269,7 +6304,7 @@ impl Workspace {
 
     pub fn join_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_item = self.active_pane.read(cx).active_item();
-        for pane in &self.panes {
+        for pane in self.center.panes() {
             join_pane_into_active(&self.active_pane, pane, window, cx);
         }
         if let Some(active_item) = active_item {
@@ -6303,7 +6338,40 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.center.remove(&pane, cx).unwrap() {
+        let mut focus_on = focus_on;
+        let removed = if let Some(index) = self.background_tab_page_index(&pane) {
+            let slot = if index < self.active_tab_page {
+                index
+            } else {
+                index - 1
+            };
+            if !self.tab_pages[slot]
+                .center
+                .remove(&pane, cx)
+                .unwrap_or(false)
+            {
+                self.tab_pages.remove(slot);
+                if index < self.active_tab_page {
+                    self.active_tab_page -= 1;
+                }
+            }
+            true
+        } else {
+            match self.center.remove(&pane, cx) {
+                Ok(true) | Err(_) => true,
+                Ok(false) if !self.tab_pages.is_empty() => {
+                    let slot = self.active_tab_page.min(self.tab_pages.len() - 1);
+                    let page = self.tab_pages.remove(slot);
+                    self.center = page.center;
+                    self.active_tab_page = slot;
+                    self.maximized_pane = None;
+                    focus_on = Some(self.center_pane_or_first(Some(&page.active_pane)));
+                    true
+                }
+                Ok(false) => false,
+            }
+        };
+        if removed {
             if self
                 .maximized_pane
                 .as_ref()
@@ -6325,6 +6393,169 @@ impl Workspace {
             self.active_item_path_changed(true, window, cx);
         }
         cx.emit(Event::PaneRemoved);
+    }
+
+    fn background_tab_page_index(&self, pane: &Entity<Pane>) -> Option<usize> {
+        let slot = self
+            .tab_pages
+            .iter()
+            .position(|page| page.center.panes().contains(&pane))?;
+        Some(if slot < self.active_tab_page {
+            slot
+        } else {
+            slot + 1
+        })
+    }
+
+    pub fn active_tab_page(&self) -> usize {
+        self.active_tab_page
+    }
+
+    fn center_pane_or_first(&self, pane: Option<&WeakEntity<Pane>>) -> Entity<Pane> {
+        pane.and_then(|pane| pane.upgrade())
+            .filter(|pane| self.center.panes().contains(&pane))
+            .unwrap_or_else(|| self.center.first_pane())
+    }
+
+    pub fn new_tab_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous_pane = self
+            .center_pane_or_first(self.last_active_center_pane.as_ref())
+            .downgrade();
+        let pane = self.add_pane(window, cx);
+        let mut center = PaneGroup::new(pane.clone());
+        center.set_is_center(true);
+        center.mark_positions(cx);
+        let previous_center = std::mem::replace(&mut self.center, center);
+        self.tab_pages.insert(
+            self.active_tab_page,
+            TabPage {
+                center: previous_center,
+                active_pane: previous_pane,
+            },
+        );
+        self.active_tab_page += 1;
+        self.maximized_pane = None;
+        self.set_active_pane(&pane, window, cx);
+        cx.notify();
+        self.serialize_workspace(window, cx);
+    }
+
+    pub fn activate_tab_page(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index == self.active_tab_page || index > self.tab_pages.len() {
+            return;
+        }
+        let previous_pane = self
+            .center_pane_or_first(self.last_active_center_pane.as_ref())
+            .downgrade();
+        let (target_slot, previous_slot) = if index < self.active_tab_page {
+            (index, self.active_tab_page - 1)
+        } else {
+            (index - 1, self.active_tab_page)
+        };
+        let page = self.tab_pages.remove(target_slot);
+        let previous_center = std::mem::replace(&mut self.center, page.center);
+        self.tab_pages.insert(
+            previous_slot,
+            TabPage {
+                center: previous_center,
+                active_pane: previous_pane,
+            },
+        );
+        self.active_tab_page = index;
+        self.maximized_pane = None;
+        let pane = self.center_pane_or_first(Some(&page.active_pane));
+        self.set_active_pane(&pane, window, cx);
+        window.focus(&pane.focus_handle(cx), cx);
+        cx.notify();
+        self.serialize_workspace(window, cx);
+    }
+
+    pub fn activate_next_tab_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tab_pages.len() + 1;
+        self.activate_tab_page((self.active_tab_page + 1) % count, window, cx);
+    }
+
+    pub fn activate_previous_tab_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tab_pages.len() + 1;
+        self.activate_tab_page((self.active_tab_page + count - 1) % count, window, cx);
+    }
+
+    pub fn close_tab_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_pages.is_empty() {
+            return;
+        }
+        for pane in self.center.panes().into_iter().cloned().collect::<Vec<_>>() {
+            pane.update(cx, |pane, cx| {
+                pane.close_all_items(
+                    &CloseAllItems {
+                        save_intent: None,
+                        close_pinned: true,
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+
+    fn render_tab_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut pages = Vec::new();
+        for index in 0..=self.tab_pages.len() {
+            let pane = if index == self.active_tab_page {
+                self.center_pane_or_first(self.last_active_center_pane.as_ref())
+            } else {
+                let slot = if index < self.active_tab_page {
+                    index
+                } else {
+                    index - 1
+                };
+                let page = &self.tab_pages[slot];
+                page.active_pane
+                    .upgrade()
+                    .unwrap_or_else(|| page.center.first_pane())
+            };
+            let label = match pane.read(cx).active_item() {
+                Some(item) => {
+                    let text = match item.project_path(cx) {
+                        Some(path) => path.path.display(PathStyle::local()).to_string(),
+                        None => item.tab_content_text(0, cx).to_string(),
+                    };
+                    if item.is_dirty(cx) {
+                        format!("{text} +")
+                    } else {
+                        text
+                    }
+                }
+                None => "[No Name]".to_string(),
+            };
+            let active = index == self.active_tab_page;
+            pages.push(
+                div()
+                    .id(("tab-page", index))
+                    .px_2()
+                    .child(
+                        Label::new(label)
+                            .buffer_font(cx)
+                            .size(LabelSize::Large)
+                            .single_line()
+                            .color(if active { Color::Default } else { Color::Muted })
+                            .weight(if active {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            }),
+                    )
+                    .on_click(cx.listener(move |workspace, _, window, cx| {
+                        workspace.activate_tab_page(index, window, cx);
+                    })),
+            );
+        }
+        h_flex()
+            .w_full()
+            .flex_none()
+            .bg(cx.theme().colors().tab_bar_background)
+            .children(pages)
     }
 
     pub fn panes_mut(&mut self) -> &mut [Entity<Pane>] {
@@ -7645,7 +7876,13 @@ impl Workspace {
             }
             focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         } else if removing_active_pane {
-            let fallback_pane = self.panes.last().unwrap().clone();
+            let fallback_pane = self
+                .panes
+                .iter()
+                .rev()
+                .find(|pane| self.tab_pages.is_empty() || self.center.panes().contains(pane))
+                .cloned()
+                .unwrap_or_else(|| self.center.first_pane());
             self.set_active_pane(&fallback_pane, window, cx);
             if !self.has_active_modal(window, cx) {
                 fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
@@ -7733,7 +7970,20 @@ impl Workspace {
                     .user_toolchains(cx)
                     .unwrap_or_default();
 
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
+                let mut center_group = build_serialized_pane_group(&self.center.root, window, cx);
+                if !self.tab_pages.is_empty() {
+                    let mut children = self
+                        .tab_pages
+                        .iter()
+                        .map(|page| build_serialized_pane_group(&page.center.root, window, cx))
+                        .collect::<Vec<_>>();
+                    children.insert(self.active_tab_page, center_group);
+                    center_group = SerializedPaneGroup::Group {
+                        axis: SerializedAxis(Axis::Horizontal),
+                        flexes: Some(vec![TAB_PAGES_MARKER, self.active_tab_page as f32]),
+                        children,
+                    };
+                }
                 let docks = build_serialized_docks(self, window, cx);
                 let default_docks = (paths.is_empty()
                     && location == SerializedWorkspaceLocation::Local)
@@ -7871,23 +8121,42 @@ impl Workspace {
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
 
             let mut center_group = None;
-            let mut center_items = None;
+            let mut center_items = Vec::new();
+            let mut tab_pages = Vec::new();
 
-            // Traverse the splits tree and add to things
-            if let Some((group, active_pane, items)) = serialized_workspace
-                .center_group
-                .deserialize(&project, serialized_workspace.id, workspace.clone(), cx)
-                .await
-            {
-                center_items = Some(items);
-                center_group = Some((group, active_pane))
+            let (page_groups, active_tab_page) = match serialized_workspace.center_group {
+                SerializedPaneGroup::Group {
+                    flexes: Some(flexes),
+                    children,
+                    ..
+                } if flexes.first() == Some(&TAB_PAGES_MARKER) => {
+                    (children, flexes.get(1).copied().unwrap_or(0.0) as usize)
+                }
+                group => (vec![group], 0),
+            };
+            for (index, group) in page_groups.into_iter().enumerate() {
+                if let Some((group, active_pane, items)) = group
+                    .deserialize(&project, serialized_workspace.id, workspace.clone(), cx)
+                    .await
+                {
+                    center_items.extend(items);
+                    tab_pages.push((index, group, active_pane));
+                }
+            }
+            let active_tab_page = tab_pages
+                .iter()
+                .position(|(index, ..)| *index >= active_tab_page)
+                .unwrap_or(tab_pages.len().saturating_sub(1));
+            if !tab_pages.is_empty() {
+                let (_, group, active_pane) = tab_pages.remove(active_tab_page);
+                center_group = Some((group, active_pane));
             }
 
             let mut items_by_project_path = HashMap::default();
             let mut item_ids_by_kind = HashMap::default();
             let mut all_deserialized_items = Vec::default();
             cx.update(|_, cx| {
-                for item in center_items.unwrap_or_default().into_iter().flatten() {
+                for item in center_items.into_iter().flatten() {
                     if let Some(serializable_item_handle) = item.to_serializable_item_handle(cx) {
                         item_ids_by_kind
                             .entry(serializable_item_handle.serialized_item_kind())
@@ -7913,12 +8182,32 @@ impl Workspace {
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
                 if let Some((center_group, active_pane)) = center_group {
+                    for page in std::mem::take(&mut workspace.tab_pages) {
+                        workspace.remove_panes(page.center.root, window, cx);
+                    }
                     workspace.remove_panes(workspace.center.root.clone(), window, cx);
 
                     // Swap workspace center group
                     workspace.center = PaneGroup::with_root(center_group);
                     workspace.center.set_is_center(true);
                     workspace.center.mark_positions(cx);
+
+                    workspace.tab_pages = tab_pages
+                        .into_iter()
+                        .map(|(_, group, active_pane)| {
+                            let mut center = PaneGroup::with_root(group);
+                            center.set_is_center(true);
+                            center.mark_positions(cx);
+                            let active_pane = active_pane
+                                .unwrap_or_else(|| center.first_pane())
+                                .downgrade();
+                            TabPage {
+                                center,
+                                active_pane,
+                            }
+                        })
+                        .collect();
+                    workspace.active_tab_page = active_tab_page;
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
@@ -8118,6 +8407,32 @@ impl Workspace {
             )
             .on_action(cx.listener(|workspace, _: &ActivateNextPane, window, cx| {
                 workspace.activate_next_pane(window, cx)
+            }))
+            .on_action(cx.listener(|workspace, action: &NewTabPage, window, cx| {
+                if action.terminal {
+                    window.dispatch_action(NewCenterTerminal::default().boxed_clone(), cx);
+                } else {
+                    window.dispatch_action(NewFile.boxed_clone(), cx);
+                }
+                workspace.new_tab_page(window, cx);
+            }))
+            .on_action(
+                cx.listener(|workspace, _: &ActivateNextTabPage, window, cx| {
+                    workspace.activate_next_tab_page(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|workspace, _: &ActivatePreviousTabPage, window, cx| {
+                    workspace.activate_previous_tab_page(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|workspace, action: &ActivateTabPage, window, cx| {
+                    workspace.activate_tab_page(action.0, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|workspace, _: &CloseTabPage, window, cx| {
+                workspace.close_tab_page(window, cx)
             }))
             .on_action(cx.listener(|workspace, _: &ActivateLastPane, window, cx| {
                 workspace.activate_last_pane(window, cx)
@@ -8875,7 +9190,7 @@ impl Workspace {
         &self,
         render_cx: &PaneRenderContext,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
             .id("editor-region")
@@ -8885,13 +9200,18 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
+            .flex()
+            .flex_col()
+            .when(!self.tab_pages.is_empty(), |this| {
+                this.child(self.render_tab_line(cx))
+            })
+            .child(div().flex_1().min_h_0().w_full().child(self.center.render(
                 self.zoomed.as_ref(),
                 self.maximized_pane.as_ref(),
                 render_cx,
                 window,
                 cx,
-            ))
+            )))
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -15271,6 +15591,103 @@ mod tests {
                 left_panel.panel_id(),
                 "Left panel should be the visible panel in the right dock"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tab_pages(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let first_item = cx.new(|cx| TestItem::new(cx).with_label("first"));
+        let second_item = cx.new(|cx| TestItem::new(cx).with_label("second"));
+        let third_item = cx.new(|cx| TestItem::new(cx).with_label("third"));
+
+        let (first_pane, split_pane) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(first_item.clone()), None, true, window, cx);
+            let first_pane = workspace.active_pane().clone();
+            let split_pane =
+                workspace.split_pane(first_pane.clone(), SplitDirection::Right, window, cx);
+            (first_pane, split_pane)
+        });
+        let second_pane = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.new_tab_page(window, cx);
+            workspace.add_item_to_active_pane(
+                Box::new(second_item.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            workspace.active_pane().clone()
+        });
+        let third_pane = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.new_tab_page(window, cx);
+            workspace.add_item_to_active_pane(Box::new(third_item.clone()), None, true, window, cx);
+            workspace.active_pane().clone()
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.active_tab_page, 2);
+            assert_eq!(workspace.center.panes(), vec![&third_pane]);
+            workspace.activate_tab_page(0, window, cx);
+            assert_eq!(workspace.active_tab_page, 0);
+            assert_eq!(workspace.center.panes(), vec![&first_pane, &split_pane]);
+            assert!(workspace.center.panes().contains(&workspace.active_pane()));
+        });
+
+        second_pane
+            .update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(second_item.entity_id(), SaveIntent::Skip, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.tab_pages.len(), 1);
+            assert_eq!(workspace.active_tab_page, 0);
+            assert!(!workspace.panes().contains(&second_pane));
+        });
+
+        first_pane
+            .update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(first_item.entity_id(), SaveIntent::Skip, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_tab_page, 0);
+            assert_eq!(workspace.center.panes(), vec![&split_pane]);
+            assert_eq!(workspace.active_pane(), &split_pane);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&third_item, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert_eq!(workspace.active_tab_page, 1);
+            assert_eq!(workspace.center.panes(), vec![&third_pane]);
+        });
+
+        third_pane
+            .update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(third_item.entity_id(), SaveIntent::Skip, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            assert!(workspace.tab_pages.is_empty());
+            assert_eq!(workspace.active_tab_page, 0);
+            assert_eq!(workspace.center.panes(), vec![&split_pane]);
+            assert_eq!(workspace.active_pane(), &split_pane);
         });
     }
 

@@ -242,6 +242,7 @@ actions!(
 #[action(namespace = vim, no_json, no_register)]
 struct VimEdit {
     pub filename: String,
+    pub new_tab_page: bool,
 }
 
 /// Pastes the specified file's contents.
@@ -659,6 +660,9 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             };
 
             let _ = workspace.update(cx, |workspace, cx| {
+                if action.new_tab_page {
+                    workspace.new_tab_page(window, cx);
+                }
                 workspace
                     .open_path(project_path, None, true, window, cx)
                     .detach_and_log_err(cx);
@@ -1472,7 +1476,15 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
         }),
         VimCommand::new(("e", "dit"), editor::actions::ReloadFile)
             .bang(editor::actions::ReloadFile)
-            .filename(|_, filename| Some(VimEdit { filename }.boxed_clone())),
+            .filename(|_, filename| {
+                Some(
+                    VimEdit {
+                        filename,
+                        new_tab_page: false,
+                    }
+                    .boxed_clone(),
+                )
+            }),
         VimCommand::new(
             ("r", "ead"),
             VimRead {
@@ -1516,10 +1528,28 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
                 )
             },
         ),
-        VimCommand::new(("tabe", "dit"), workspace::NewFile)
-            .filename(|_action, filename| Some(VimEdit { filename }.boxed_clone())),
-        VimCommand::new(("tabnew", ""), workspace::NewFile)
-            .filename(|_action, filename| Some(VimEdit { filename }.boxed_clone())),
+        VimCommand::new(("tabe", "dit"), workspace::NewTabPage::default()).filename(
+            |_action, filename| {
+                Some(
+                    VimEdit {
+                        filename,
+                        new_tab_page: true,
+                    }
+                    .boxed_clone(),
+                )
+            },
+        ),
+        VimCommand::new(("tabnew", ""), workspace::NewTabPage::default()).filename(
+            |_action, filename| {
+                Some(
+                    VimEdit {
+                        filename,
+                        new_tab_page: true,
+                    }
+                    .boxed_clone(),
+                )
+            },
+        ),
         VimCommand::new(
             ("q", "uit"),
             workspace::CloseActiveItem {
@@ -1664,20 +1694,10 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
         VimCommand::str(("ls", ""), "tab_switcher::ToggleAll"),
         VimCommand::new(("new", ""), workspace::NewFileSplitHorizontal),
         VimCommand::new(("vne", "w"), workspace::NewFileSplitVertical),
-        VimCommand::new(("tabn", "ext"), workspace::ActivateNextItem::default()).count(),
-        VimCommand::new(
-            ("tabp", "revious"),
-            workspace::ActivatePreviousItem::default(),
-        )
-        .count(),
-        VimCommand::new(("tabN", "ext"), workspace::ActivatePreviousItem::default()).count(),
-        VimCommand::new(
-            ("tabc", "lose"),
-            workspace::CloseActiveItem {
-                save_intent: Some(SaveIntent::Close),
-                close_pinned: false,
-            },
-        ),
+        VimCommand::new(("tabn", "ext"), workspace::ActivateNextTabPage).count(),
+        VimCommand::new(("tabp", "revious"), workspace::ActivatePreviousTabPage).count(),
+        VimCommand::new(("tabN", "ext"), workspace::ActivatePreviousTabPage).count(),
+        VimCommand::new(("tabc", "lose"), workspace::CloseTabPage),
         VimCommand::new(
             ("tabo", "nly"),
             workspace::CloseOtherItems {

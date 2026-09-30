@@ -447,50 +447,24 @@ pub fn init(cx: &mut App) {
                 }
             })
         });
-        workspace.register_action(|_, _: &GoToTab, window, cx| {
+        workspace.register_action(|workspace, _: &GoToTab, window, cx| {
             let count = Vim::take_count(cx);
             Vim::take_forced_motion(cx);
 
-            if let Some(tab_index) = count {
-                // <count>gt goes to tab <count> (1-based).
-                let zero_based_index = tab_index.saturating_sub(1);
-                window.dispatch_action(
-                    workspace::pane::ActivateItem(zero_based_index).boxed_clone(),
-                    cx,
-                );
-            } else {
-                // If no count is provided, go to the next tab.
-                window.dispatch_action(
-                    workspace::pane::ActivateNextItem::default().boxed_clone(),
-                    cx,
-                );
+            match count {
+                Some(tab_index) => {
+                    workspace.activate_tab_page(tab_index.saturating_sub(1), window, cx)
+                }
+                None => workspace.activate_next_tab_page(window, cx),
             }
         });
 
         workspace.register_action(|workspace, _: &GoToPreviousTab, window, cx| {
-            let count = Vim::take_count(cx);
+            let count = Vim::take_count(cx).unwrap_or(1);
             Vim::take_forced_motion(cx);
 
-            if let Some(count) = count {
-                // gT with count goes back that many tabs with wraparound (not the same as gt!).
-                let pane = workspace.active_pane().read(cx);
-                let item_count = pane.items().count();
-                if item_count > 0 {
-                    let current_index = pane.active_item_index();
-                    let target_index = (current_index as isize - count as isize)
-                        .rem_euclid(item_count as isize)
-                        as usize;
-                    window.dispatch_action(
-                        workspace::pane::ActivateItem(target_index).boxed_clone(),
-                        cx,
-                    );
-                }
-            } else {
-                // No count provided, go to the previous tab.
-                window.dispatch_action(
-                    workspace::pane::ActivatePreviousItem::default().boxed_clone(),
-                    cx,
-                );
+            for _ in 0..count {
+                workspace.activate_previous_tab_page(window, cx);
             }
         });
     })

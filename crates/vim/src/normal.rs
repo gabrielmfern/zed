@@ -2438,6 +2438,28 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_find_forward_bindings_keep_find_working(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update(|_, cx| {
+            cx.bind_keys([KeyBinding::new(
+                "f",
+                editor::actions::MoveToBeginning,
+                Some("VimFindForward"),
+            )])
+        });
+
+        cx.set_state("ˇone (two) three four", Mode::Normal);
+        cx.simulate_keystrokes("f (");
+        cx.assert_state("one ˇ(two) three four", Mode::Normal);
+
+        cx.simulate_keystrokes("d f f");
+        cx.assert_state("one ˇour", Mode::Normal);
+
+        cx.simulate_keystrokes("f f l");
+        cx.assert_state("oˇne our", Mode::Normal);
+    }
+
+    #[gpui::test]
     async fn test_go_to_tab_with_count(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 

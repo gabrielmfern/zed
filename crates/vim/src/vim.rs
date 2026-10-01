@@ -1104,7 +1104,12 @@ impl Vim {
                         cx.stop_propagation();
                     }
                 }
-                _ if !operator.is_waiting(self.mode) => {
+                _ if !operator.is_waiting(self.mode)
+                    || matches!(
+                        operator,
+                        Operator::FindForward { .. } | Operator::FindBackward { .. }
+                    ) && keystroke_event.action.is_some() =>
+                {
                     self.clear_operator(window, cx);
                     self.stop_recording_immediately(Box::new(ClearOperators), cx)
                 }
@@ -1517,6 +1522,13 @@ impl Vim {
         // bindings in those states (e.g. text objects after `mi`/`ma`).
         if self.mode.is_helix() {
             context.add("helix_mode");
+        }
+        if self.mode == Mode::Normal && self.operator_stack.len() == 1 {
+            match self.operator_stack.last() {
+                Some(Operator::FindForward { before: false, .. }) => context.add("VimFindForward"),
+                Some(Operator::FindBackward { after: false, .. }) => context.add("VimFindBackward"),
+                _ => {}
+            }
         }
         context.set("vim_mode", mode);
         context.set("vim_operator", operator_id);
